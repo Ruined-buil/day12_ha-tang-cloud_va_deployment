@@ -91,7 +91,7 @@ curl http://localhost:8000/ask -X POST \
   -H "Content-Type: application/json" \
   -d '{"question": "Hello"}'
 ```
-
+aa
 **Quan sát:** Nó chạy! Nhưng có production-ready không?
 
 ###  Exercise 1.3: So sánh với advanced version

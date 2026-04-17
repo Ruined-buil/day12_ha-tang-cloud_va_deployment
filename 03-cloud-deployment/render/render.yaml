@@ -54,3 +54,15 @@ services:
 #   3. Connect repo → Render đọc render.yaml này
 #   4. Review và Deploy
 # ============================================================
+
+# ──────────────────────────────────────
+  # Redis (dùng Render Redis add-on)
+  # ──────────────────────────────────────
+  - type: redis
+    name: agent-cache
+    plan: free
+    maxmemoryPolicy: allkeys-lru
+    # Thêm phần này vào:
+    ipAllowList:
+      - source: 0.0.0.0/0
+        description: Allow all (Required for web service to connect)
