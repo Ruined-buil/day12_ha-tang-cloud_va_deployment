@@ -1,220 +1,203 @@
 """
-ADVANCED — Stateless Agent với Redis Session
+ADVANCED — Full Security Stack
 
-Stateless = agent không giữ state trong memory.
-Mọi state (session, conversation history) lưu trong Redis.
+Kết hợp:
+  ✅ JWT Authentication
+  ✅ Role-based access (user / admin)
+  ✅ Rate limiting (sliding window)
+  ✅ Cost guard (daily budget)
+  ✅ Input validation
+  ✅ Security headers
 
-Tại sao stateless quan trọng khi scale?
-  Instance 1: User A gửi request 1 → lưu session trong memory
-  Instance 2: User A gửi request 2 → KHÔNG có session! Bug!
+Chạy:
+    python app.py
 
-  ✅ Giải pháp: Lưu session trong Redis
-  Bất kỳ instance nào cũng đọc được session của user.
+Lấy token:
+    curl -X POST http://localhost:8000/auth/token \\
+         -H "Content-Type: application/json" \\
+         -d '{"username": "student", "password": "demo123"}'
 
-Demo:
-  docker compose up
-  # Sau đó test multi-turn conversation
-  python test_stateless.py
+Dùng token:
+    curl -H "Authorization: Bearer <token>" \\
+         -X POST http://localhost:8000/ask \\
+         -H "Content-Type: application/json" \\
+         -d '{"question": "what is docker?"}'
 """
 import os
 import time
-import json
 import logging
-import uuid
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 
 
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, Depends, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import uvicorn
+
+from auth import verify_token, authenticate_user, create_token
+from rate_limiter import rate_limiter_user, rate_limiter_admin
+from cost_guard import cost_guard
 from utils.mock_llm import ask
-
-# ── Redis (optional — fallback to in-memory dict nếu không có Redis)
-try:
-    import redis
-    REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-    _redis = redis.from_url(REDIS_URL, decode_responses=True)
-    _redis.ping()
-    USE_REDIS = True
-    print("✅ Connected to Redis")
-except Exception:
-    USE_REDIS = False
-    _memory_store: dict = {}
-    print("⚠️  Redis not available — using in-memory store (not scalable!)")
-
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 START_TIME = time.time()
-INSTANCE_ID = os.getenv("INSTANCE_ID", f"instance-{uuid.uuid4().hex[:6]}")
-
-
-# ──────────────────────────────────────────────────────────
-# Session Storage (Redis-backed, Stateless-compatible)
-# ──────────────────────────────────────────────────────────
-
-def save_session(session_id: str, data: dict, ttl_seconds: int = 3600):
-    """Lưu session vào Redis với TTL."""
-    serialized = json.dumps(data)
-    if USE_REDIS:
-        _redis.setex(f"session:{session_id}", ttl_seconds, serialized)
-    else:
-        _memory_store[f"session:{session_id}"] = data
-
-
-def load_session(session_id: str) -> dict:
-    """Load session từ Redis."""
-    if USE_REDIS:
-        data = _redis.get(f"session:{session_id}")
-        return json.loads(data) if data else {}
-    return _memory_store.get(f"session:{session_id}", {})
-
-
-def append_to_history(session_id: str, role: str, content: str):
-    """Thêm message vào conversation history."""
-    session = load_session(session_id)
-    history = session.get("history", [])
-    history.append({
-        "role": role,
-        "content": content,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    })
-    # Giữ tối đa 20 messages (10 turns)
-    if len(history) > 20:
-        history = history[-20:]
-    session["history"] = history
-    save_session(session_id, session)
-    return history
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info(f"Starting instance {INSTANCE_ID}")
-    logger.info(f"Storage: {'Redis ✅' if USE_REDIS else 'In-memory ⚠️'}")
+    logger.info("Security layer initialized")
     yield
-    logger.info(f"Instance {INSTANCE_ID} shutting down")
+    logger.info("Shutdown")
 
 
 app = FastAPI(
-    title="Stateless Agent",
-    version="4.0.0",
+    title="Agent — Full Security Stack",
+    version="3.0.0",
     lifespan=lifespan,
+    # ✅ Ẩn /docs trong production
+    docs_url="/docs" if os.getenv("ENVIRONMENT") != "production" else None,
 )
 
+# ──────────────────────────────────────────────────────────
+# Security Middleware
+# ──────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(","),
+    allow_methods=["GET", "POST"],
+    allow_headers=["Authorization", "Content-Type", "X-API-Key"],
 )
 
 
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    """Thêm security headers vào mọi response."""
+    response: Response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    # Ẩn server info
+    response.headers.pop("server", None)
+    return response
+
+
 # ──────────────────────────────────────────────────────────
-# Models
+# Request/Response Models
+# ──────────────────────────────────────────────────────────
+class AskRequest(BaseModel):
+    question: str = Field(..., min_length=1, max_length=1000)
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+# ──────────────────────────────────────────────────────────
+# Auth Endpoints
 # ──────────────────────────────────────────────────────────
 
-class ChatRequest(BaseModel):
-    question: str
-    session_id: str | None = None  # None = tạo session mới
-
-
-# ──────────────────────────────────────────────────────────
-# Endpoints
-# ──────────────────────────────────────────────────────────
-
-@app.post("/chat")
-async def chat(body: ChatRequest):
+@app.post("/auth/token")
+def login(body: LoginRequest):
     """
-    Multi-turn conversation với session management.
-
-    Gửi session_id trong các request tiếp theo để tiếp tục cuộc trò chuyện.
-    Agent có thể chạy trên bất kỳ instance nào — state trong Redis.
+    Public endpoint. Đổi username/password lấy JWT token.
+    Token hết hạn sau 60 phút.
     """
-    # Tạo hoặc dùng session hiện có
-    session_id = body.session_id or str(uuid.uuid4())
+    user = authenticate_user(body.username, body.password)
+    token = create_token(user["username"], user["role"])
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_in_minutes": 60,
+        "hint": f"Include in header: Authorization: Bearer {token[:20]}...",
+    }
 
-    # Thêm câu hỏi vào history
-    append_to_history(session_id, "user", body.question)
 
-    # Gọi LLM với context (trong mock, ta chỉ dùng câu hỏi hiện tại)
-    session = load_session(session_id)
-    history = session.get("history", [])
-    answer = ask(body.question)
+# ──────────────────────────────────────────────────────────
+# Protected Agent Endpoint
+# ──────────────────────────────────────────────────────────
 
-    # Lưu response vào history
-    append_to_history(session_id, "assistant", answer)
+@app.post("/ask")
+async def ask_agent(
+    body: AskRequest,
+    request: Request,
+    user: dict = Depends(verify_token),  # ✅ JWT required
+):
+    """
+    Protected endpoint. Yêu cầu:
+    1. Valid JWT token
+    2. Trong rate limit
+    3. Trong budget
+    """
+    username = user["username"]
+    role = user["role"]
+
+    # ✅ Rate limiting — theo role
+    limiter = rate_limiter_admin if role == "admin" else rate_limiter_user
+    rate_info = limiter.check(username)
+
+    # ✅ Cost check trước khi gọi LLM
+    cost_guard.check_budget(username)
+
+    # Gọi LLM (mock)
+    response_text = ask(body.question)
+
+    # ✅ Ghi nhận usage (mock token count)
+    input_tokens = len(body.question.split()) * 2
+    output_tokens = len(response_text.split()) * 2
+    usage = cost_guard.record_usage(username, input_tokens, output_tokens)
 
     return {
-        "session_id": session_id,
         "question": body.question,
-        "answer": answer,
-        "turn": len([m for m in history if m["role"] == "user"]) + 1,
-        "served_by": INSTANCE_ID,  # ← thấy rõ bất kỳ instance nào cũng serve được
-        "storage": "redis" if USE_REDIS else "in-memory",
+        "answer": response_text,
+        "usage": {
+            "requests_remaining": rate_info["remaining"],
+            "budget_remaining_usd": usage.total_cost_usd,
+        },
     }
 
 
-@app.get("/chat/{session_id}/history")
-def get_history(session_id: str):
-    """Xem conversation history của một session."""
-    session = load_session(session_id)
-    if not session:
-        raise HTTPException(404, f"Session {session_id} not found or expired")
+@app.get("/me/usage")
+def my_usage(user: dict = Depends(verify_token)):
+    """Xem usage của bản thân."""
+    return cost_guard.get_usage(user["username"])
+
+
+@app.get("/admin/stats")
+def admin_stats(user: dict = Depends(verify_token)):
+    """Admin only: xem tổng stats."""
+    if user["role"] != "admin":
+        raise HTTPException(403, "Admin only")
     return {
-        "session_id": session_id,
-        "messages": session.get("history", []),
-        "count": len(session.get("history", [])),
+        "total_users": "N/A (in-memory demo)",
+        "global_cost_usd": cost_guard._global_cost,
+        "global_budget_usd": cost_guard.global_daily_budget_usd,
     }
-
-
-@app.delete("/chat/{session_id}")
-def delete_session(session_id: str):
-    """Xóa session (user logout)."""
-    if USE_REDIS:
-        _redis.delete(f"session:{session_id}")
-    else:
-        _memory_store.pop(f"session:{session_id}", None)
-    return {"deleted": session_id}
 
 
 # ──────────────────────────────────────────────────────────
-# Health / Metrics
+# Health Checks (public)
 # ──────────────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
-    redis_ok = False
-    if USE_REDIS:
-        try:
-            _redis.ping()
-            redis_ok = True
-        except Exception:
-            redis_ok = False
-
-    status = "ok" if (not USE_REDIS or redis_ok) else "degraded"
-
     return {
-        "status": status,
-        "instance_id": INSTANCE_ID,
+        "status": "ok",
         "uptime_seconds": round(time.time() - START_TIME, 1),
-        "storage": "redis" if USE_REDIS else "in-memory",
-        "redis_connected": redis_ok if USE_REDIS else "N/A",
+        "security": "JWT + RateLimit + CostGuard",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
-
-
-@app.get("/ready")
-def ready():
-    if USE_REDIS:
-        try:
-            _redis.ping()
-        except Exception:
-            raise HTTPException(503, "Redis not available")
-    return {"ready": True, "instance": INSTANCE_ID}
 
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port, reload=True)
+    print("\n=== Demo credentials ===")
+    print("  student / demo123  (10 req/min, $1/day budget)")
+    print("  teacher / teach456 (100 req/min, $1/day budget)")
+    print(f"\nDocs: http://localhost:{port}/docs\n")
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=True)
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=True)

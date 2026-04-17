@@ -17,7 +17,7 @@ import redis
 from app.config import settings
 from app.auth import verify_api_key
 from app.rate_limiter import check_rate_limit
-from app.cost_guard import check_and_record_cost, get_daily_cost
+from app.cost_guard import check_budget, check_and_record_cost, get_monthly_cost
 
 # Mock LLM
 from utils.mock_llm import ask as llm_ask
@@ -26,7 +26,7 @@ from utils.mock_llm import ask as llm_ask
 # Logging — JSON structured
 # ─────────────────────────────────────────────────────────
 logging.basicConfig(
-    level=logging.DEBUG if settings.debug else logging.INFO,
+    level=getattr(logging, settings.log_level, logging.INFO),
     format='{"ts":"%(asctime)s","lvl":"%(levelname)s","msg":"%(message)s"}',
 )
 logger = logging.getLogger(__name__)
@@ -87,6 +87,19 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type", "X-API-Key"],
 )
 
+
+def _to_user_id(api_key: str) -> str:
+    return api_key[:8]
+
+
+def rate_limit_dependency(api_key: str = Depends(verify_api_key)) -> None:
+    check_rate_limit(_to_user_id(api_key))
+
+
+def budget_dependency(api_key: str = Depends(verify_api_key)) -> None:
+    # Pre-flight budget check; actual request cost is recorded after response generation.
+    check_budget(_to_user_id(api_key), estimated_cost=0.0)
+
 @app.middleware("http")
 async def request_middleware(request: Request, call_next):
     global _request_count, _error_count
@@ -97,7 +110,8 @@ async def request_middleware(request: Request, call_next):
         # Security headers
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
-        response.headers.pop("server", None)
+        if "server" in response.headers:
+            del response.headers["server"]
         duration = round((time.time() - start) * 1000, 1)
         logger.info(json.dumps({
             "event": "request",
@@ -146,19 +160,15 @@ def root():
 @app.post("/ask", response_model=AskResponse, tags=["Agent"])
 async def ask_agent(
     body: AskRequest,
-    request: Request,
-    _key: str = Depends(verify_api_key),
+    _request: Request,
+    _rate_limit: None = Depends(rate_limit_dependency),
+    _budget: None = Depends(budget_dependency),
+    api_key: str = Depends(verify_api_key),
 ):
-    # Rate limit (stateless via Redis)
-    check_rate_limit(_key[:8])
-
-    # Budget check (stateless via Redis)
-    input_tokens = len(body.question.split()) * 2
-    check_and_record_cost(input_tokens, 0)
+    user_id = _to_user_id(api_key)
 
     # State: Get conversation history from Redis
     history = []
-    user_id = _key[:8]
     if r:
         history = r.lrange(f"history:{user_id}", -10, -1) # Last 5 turns (q+a)
 
@@ -178,8 +188,9 @@ async def ask_agent(
         r.ltrim(f"history:{user_id}", -20, -1) # Keep last 10 turns
         r.expire(f"history:{user_id}", 3600)   # 1 hour TTL
 
+    input_tokens = len(body.question.split()) * 2
     output_tokens = len(answer.split()) * 2
-    check_and_record_cost(0, output_tokens)
+    check_and_record_cost(user_id, input_tokens, output_tokens)
 
     return AskResponse(
         question=body.question,
@@ -216,14 +227,15 @@ def ready():
 @app.get("/metrics", tags=["Operations"])
 def metrics(_key: str = Depends(verify_api_key)):
     """Basic metrics (protected)."""
-    daily_cost = get_daily_cost()
+    user_id = _to_user_id(_key)
+    monthly_cost = get_monthly_cost(user_id)
     return {
         "uptime_seconds": round(time.time() - START_TIME, 1),
         "total_requests": _request_count,
         "error_count": _error_count,
-        "daily_cost_usd": round(daily_cost, 4),
-        "daily_budget_usd": settings.daily_budget_usd,
-        "budget_used_pct": round(daily_cost / settings.daily_budget_usd * 100, 1) if settings.daily_budget_usd > 0 else 0,
+        "monthly_cost_usd": round(monthly_cost, 4),
+        "monthly_budget_usd": settings.monthly_budget_usd,
+        "budget_used_pct": round(monthly_cost / settings.monthly_budget_usd * 100, 1) if settings.monthly_budget_usd > 0 else 0,
     }
 
 # ─────────────────────────────────────────────────────────

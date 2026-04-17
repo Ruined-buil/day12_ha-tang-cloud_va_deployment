@@ -40,8 +40,8 @@
 ## Part 3: Cloud Deployment
 
 ### Exercise 3.1: Railway deployment
-- **URL**: `https://your-agent.railway.app` (Placeholder)
-- **Screenshot**: [Link to dashboard.png in screenshots/ folder]
+- **URL**: `https://lively-rebirth-production-0913.up.railway.app/
+
 
 ## Part 4: API Security
 
@@ -82,3 +82,6 @@ HTTP/1.1 429 Too Many Requests
 3.  **Stateless Design (5.3)**: Stores conversation history in Redis instead of local memory. This allows horizontal scaling without losing data.
 4.  **Load Balancing (5.4)**: Uses Nginx to distribute traffic across multiple container instances.
 5.  **Validation (5.5)**: Verified that instance restarts do not affect user sessions due to stateless design.
+
+## Part 6: Deployment
+URL: https://day12-lab-complete-production-1b0f.up.railway.app/
